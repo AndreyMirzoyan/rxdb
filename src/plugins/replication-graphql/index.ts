@@ -65,6 +65,8 @@ addRxPlugin(RxDBLeaderElectionPlugin);
  */
 addRxPlugin(RxDBWatchForChangesPlugin);
 
+type GraphQLClientInstance = {query: (query: string, variables: any, onResponse?: (req: Request, res: Response) => void) => Promise<{data: any, errors: any}>};
+type GraphQLClientFabric = (params: {url: string, headers: { [k: string]: string }}) => GraphQLClientInstance;
 
 export class RxGraphQLReplicationState {
 
@@ -79,16 +81,17 @@ export class RxGraphQLReplicationState {
         public readonly live: boolean,
         public liveInterval: number,
         public retryTime: number,
-        public readonly syncRevisions: boolean
+        public readonly syncRevisions: boolean,
+        public readonly graphQLClientFabric: GraphQLClientFabric = GraphQLClient,
     ) {
-        this.client = GraphQLClient({
+        this.client = this.graphQLClientFabric({
             url,
             headers
         });
         this.endpointHash = hash(url);
         this._prepare();
     }
-    public client: any;
+    public client: GraphQLClientInstance;
     public endpointHash: string;
     public _subjects = {
         recieved: new Subject(), // all documents that are recieved from the endpoint
@@ -457,7 +460,7 @@ export class RxGraphQLReplicationState {
     }
 
     setHeaders(headers: { [k: string]: string }): void {
-        this.client = GraphQLClient({
+        this.client = this.graphQLClientFabric({
             url: this.url,
             headers
         });
@@ -479,6 +482,7 @@ export function syncGraphQL(
         retryTime = 1000 * 5, // in ms
         autoStart = true, // if this is false, the replication does nothing at start
         syncRevisions = false,
+        graphQLClientFabric = GraphQLClient,
     }: any
 ) {
     const collection = this;
@@ -505,7 +509,8 @@ export function syncGraphQL(
         live,
         liveInterval,
         retryTime,
-        syncRevisions
+        syncRevisions,
+        graphQLClientFabric
     );
 
     if (!autoStart) return replicationState;
