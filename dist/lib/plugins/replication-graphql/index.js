@@ -109,6 +109,7 @@ function _arrayLikeToArray(arr, len) { if (len == null || len > arr.length) len 
 
 var RxGraphQLReplicationState = /*#__PURE__*/function () {
   function RxGraphQLReplicationState(collection, url, headers, pull, push, deletedFlag, lastPulledRevField, live, liveInterval, retryTime, syncRevisions) {
+    var graphQLClientFabric = arguments.length > 11 && arguments[11] !== undefined ? arguments[11] : _graphqlClient["default"];
     this._subjects = {
       recieved: new _rxjs.Subject(),
       // all documents that are recieved from the endpoint
@@ -144,7 +145,8 @@ var RxGraphQLReplicationState = /*#__PURE__*/function () {
     this.liveInterval = liveInterval;
     this.retryTime = retryTime;
     this.syncRevisions = syncRevisions;
-    this.client = (0, _graphqlClient["default"])({
+    this.graphQLClientFabric = graphQLClientFabric;
+    this.client = this.graphQLClientFabric({
       url: url,
       headers: headers
     });
@@ -834,7 +836,7 @@ var RxGraphQLReplicationState = /*#__PURE__*/function () {
   };
 
   _proto.setHeaders = function setHeaders(headers) {
-    this.client = (0, _graphqlClient["default"])({
+    this.client = this.graphQLClientFabric({
       url: this.url,
       headers: headers
     });
@@ -865,7 +867,9 @@ function syncGraphQL(_ref4) {
       _ref4$autoStart = _ref4.autoStart,
       autoStart = _ref4$autoStart === void 0 ? true : _ref4$autoStart,
       _ref4$syncRevisions = _ref4.syncRevisions,
-      syncRevisions = _ref4$syncRevisions === void 0 ? false : _ref4$syncRevisions;
+      syncRevisions = _ref4$syncRevisions === void 0 ? false : _ref4$syncRevisions,
+      _ref4$graphQLClientFa = _ref4.graphQLClientFabric,
+      graphQLClientFabric = _ref4$graphQLClientFa === void 0 ? _graphqlClient["default"] : _ref4$graphQLClientFa;
   var collection = this; // fill in defaults for pull & push
 
   if (pull) {
@@ -878,7 +882,7 @@ function syncGraphQL(_ref4) {
 
 
   collection.watchForChanges();
-  var replicationState = new RxGraphQLReplicationState(collection, url, headers, pull, push, deletedFlag, lastPulledRevField, live, liveInterval, retryTime, syncRevisions);
+  var replicationState = new RxGraphQLReplicationState(collection, url, headers, pull, push, deletedFlag, lastPulledRevField, live, liveInterval, retryTime, syncRevisions, graphQLClientFabric);
   if (!autoStart) return replicationState; // run internal so .sync() does not have to be async
 
   var waitTillRun = waitForLeadership ? this.database.waitForLeadership() : (0, _util.promiseWait)(0);

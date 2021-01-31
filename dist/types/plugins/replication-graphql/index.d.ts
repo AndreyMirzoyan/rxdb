@@ -4,6 +4,18 @@
  */
 import { BehaviorSubject, Subject, Subscription, Observable } from 'rxjs';
 import type { RxCollection, GraphQLSyncPullOptions, GraphQLSyncPushOptions, RxPlugin } from '../../types';
+declare type GraphQLClientInstance = {
+    query: (query: string, variables: any, onResponse?: (req: Request, res: Response) => void) => Promise<{
+        data: any;
+        errors: any;
+    }>;
+};
+declare type GraphQLClientFabric = (params: {
+    url: string;
+    headers: {
+        [k: string]: string;
+    };
+}) => GraphQLClientInstance;
 export declare class RxGraphQLReplicationState {
     readonly collection: RxCollection;
     readonly url: string;
@@ -18,10 +30,11 @@ export declare class RxGraphQLReplicationState {
     liveInterval: number;
     retryTime: number;
     readonly syncRevisions: boolean;
+    readonly graphQLClientFabric: GraphQLClientFabric;
     constructor(collection: RxCollection, url: string, headers: {
         [k: string]: string;
-    }, pull: GraphQLSyncPullOptions, push: GraphQLSyncPushOptions, deletedFlag: string, lastPulledRevField: string, live: boolean, liveInterval: number, retryTime: number, syncRevisions: boolean);
-    client: any;
+    }, pull: GraphQLSyncPullOptions, push: GraphQLSyncPushOptions, deletedFlag: string, lastPulledRevField: string, live: boolean, liveInterval: number, retryTime: number, syncRevisions: boolean, graphQLClientFabric?: GraphQLClientFabric);
+    client: GraphQLClientInstance;
     endpointHash: string;
     _subjects: {
         recieved: Subject<unknown>;
@@ -69,7 +82,7 @@ export declare class RxGraphQLReplicationState {
 export declare function syncGraphQL(this: RxCollection, { url, headers, waitForLeadership, pull, push, deletedFlag, lastPulledRevField, live, liveInterval, // in ms
 retryTime, // in ms
 autoStart, // if this is false, the replication does nothing at start
-syncRevisions, }: any): RxGraphQLReplicationState;
+syncRevisions, graphQLClientFabric, }: any): RxGraphQLReplicationState;
 export * from './helper';
 export * from './crawling-checkpoint';
 export * from './graphql-schema-from-rx-schema';

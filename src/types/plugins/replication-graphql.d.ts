@@ -20,6 +20,9 @@ export interface GraphQLSyncPushOptions {
     batchSize?: number;
 }
 
+export type GraphQLClientInstance = {query: (query: string, variables: any, onResponse?: (req: Request, res: Response) => void) => Promise<{data: any, errors: any}>};
+export type GraphQLClientFabric = (params: {url: string, headers: { [k: string]: string }}) => GraphQLClientInstance;
+
 export type SyncOptionsGraphQL = {
     url: string;
     headers?: { [k: string]: string }; // send with all requests to the endpoint
@@ -32,4 +35,5 @@ export type SyncOptionsGraphQL = {
     retryTime?: number; // time in ms
     autoStart?: boolean; // if this is false, the replication does nothing at start
     syncRevisions?: boolean;
+    graphQLClientFabric?: GraphQLClientFabric;
 };
