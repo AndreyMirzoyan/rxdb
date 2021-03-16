@@ -32,7 +32,8 @@ import {
     createInsertEvent,
     RxChangeEventInsert,
     RxChangeEventUpdate,
-    RxChangeEventDelete
+    RxChangeEventDelete,
+    createDeleteEvent
 } from './rx-change-event';
 import {
     newRxError,
@@ -60,6 +61,7 @@ import {
 } from './change-event-buffer';
 import { overwritable } from './overwritable';
 import {
+    runAsyncPluginHooks,
     runPluginHooks
 } from './hooks';
 
@@ -84,7 +86,9 @@ import type {
     RxDumpCollectionAny,
     MangoQuery,
     MangoQueryNoLimit,
-    RxCacheReplacementPolicy
+    RxCacheReplacementPolicy,
+    WithPouchMeta,
+    PouchWriteError
 } from './types';
 import type {
     RxGraphQLReplicationState
@@ -285,7 +289,7 @@ export class RxCollectionBase<
         obj = this._handleToPouch(obj);
         return this.database.lockedRun(
             () => this.pouch.put(obj)
-        ).catch((err: any) => {
+        ).catch((err: PouchWriteError) => {
             if (overwrite && err.status === 409) {
                 return this.database.lockedRun(
                     () => this.pouch.get(obj._id)
@@ -393,7 +397,7 @@ export class RxCollectionBase<
         docsData: RxDocumentType[]
     ): Promise<{
         success: RxDocument<RxDocumentType, OrmMethods>[],
-        error: any[]
+        error: PouchWriteError[]
     }> {
         const useDocs: RxDocumentType[] = docsData.map(docData => {
             const useDocData = fillObjectDataBeforeInsert(this, docData);
@@ -439,7 +443,11 @@ export class RxCollectionBase<
                                     );
                                 })
                             ).then(() => {
-                                return { rxDocuments, errorResults: results.filter(r => !r.ok) };
+                                const errorResults: PouchWriteError[] = results.filter(r => !r.ok) as any;
+                                return {
+                                    rxDocuments,
+                                    errorResults
+                                };
                             });
                         }).then(({ rxDocuments, errorResults }) => {
                             const endTime = now();
@@ -454,7 +462,6 @@ export class RxCollectionBase<
                                 );
                                 this.$emit(emitEvent);
                             });
-
                             return {
                                 success: rxDocuments,
                                 error: errorResults
@@ -463,6 +470,78 @@ export class RxCollectionBase<
                 }
             );
         });
+    }
+
+    async bulkRemove(
+        ids: string[]
+    ): Promise<{
+        success: RxDocument<RxDocumentType, OrmMethods>[],
+        error: any[]
+    }> {
+        const rxDocumentMap = await this.findByIds(ids);
+        const docsData: WithPouchMeta<RxDocumentType>[] = [];
+        const docsMap: Map<string, WithPouchMeta<RxDocumentType>> = new Map();
+        Array.from(rxDocumentMap.values()).forEach(rxDocument => {
+            const data = rxDocument.toJSON(true);
+            docsData.push(data);
+            docsMap.set(rxDocument.primary, data);
+        });
+
+        await Promise.all(
+            docsData.map(doc => {
+                const primary = (doc as any)[this.schema.primaryPath];
+                return this._runHooks('pre', 'remove', doc, rxDocumentMap.get(primary));
+            })
+        );
+
+        docsData.forEach(doc => doc._deleted = true);
+
+        const removeDocs = docsData.map(doc => this._handleToPouch(doc));
+
+        let startTime: number;
+
+        const results = await this.database.lockedRun(
+            async () => {
+                startTime = now();
+                const bulkResults = await this.pouch.bulkDocs(removeDocs);
+                return bulkResults;
+            }
+        );
+
+        const endTime = now();
+        const okResults = results.filter(r => r.ok);
+        await Promise.all(
+            okResults.map(r => {
+                return this._runHooks(
+                    'post',
+                    'remove',
+                    docsMap.get(r.id),
+                    rxDocumentMap.get(r.id)
+                );
+            })
+        );
+
+        okResults.forEach(r => {
+            const rxDocument = rxDocumentMap.get(r.id) as RxDocument<RxDocumentType, OrmMethods>;
+            const emitEvent = createDeleteEvent(
+                this as any,
+                docsMap.get(r.id) as any,
+                rxDocument._data,
+                startTime,
+                endTime,
+                rxDocument as any,
+            );
+            this.$emit(emitEvent);
+        });
+
+        const rxDocuments: any[] = okResults.map(r => {
+            return rxDocumentMap.get(r.id);
+        });
+
+        return {
+            success: rxDocuments,
+            error: okResults.filter(r => !r.ok)
+        };
     }
 
     /**
@@ -801,15 +880,23 @@ export class RxCollectionBase<
         this._runHooksSync('post', 'create', docData, doc);
         return doc as any;
     }
+
     destroy(): Promise<boolean> {
-        if (this.destroyed) return Promise.resolve(false);
-        if (this._onDestroyCall) { this._onDestroyCall(); }
+        if (this.destroyed) {
+            return Promise.resolve(false);
+        }
+        if (this._onDestroyCall) {
+            this._onDestroyCall();
+        }
         this._subs.forEach(sub => sub.unsubscribe());
-        if (this._changeEventBuffer) { this._changeEventBuffer.destroy(); }
+        if (this._changeEventBuffer) {
+            this._changeEventBuffer.destroy();
+        }
         this._repStates.forEach(sync => sync.cancel());
         delete this.database.collections[this.name];
         this.destroyed = true;
-        return Promise.resolve(true);
+
+        return runAsyncPluginHooks('postDestroyRxCollection', this).then(() => true);
     }
 
     /**

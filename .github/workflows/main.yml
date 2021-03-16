@@ -32,7 +32,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y chromium-browser
 
       - name: Setup Node.js environment
-        uses: actions/setup-node@v2.1.4
+        uses: actions/setup-node@v2.1.5
         with:
           node-version: 13.8.0
 
@@ -90,8 +90,8 @@ jobs:
         run: npm run build && (cd ./test/tutorials/ && npm install && npm test)
       
       - name: angular build
+        working-directory: ./examples/angular
         run: |
-          cd ./examples/angular
           npm install > "/dev/null" 2>&1
           npm run lint && npm run build
 
@@ -100,6 +100,11 @@ jobs:
         with:
           working-directory: ./examples/angular #optional
           run: npm run test:build
+
+      - name: angular test ssr
+        working-directory: ./examples/angular
+        run: npm run test:ssr
+
 
       - name: vue build
         run: |

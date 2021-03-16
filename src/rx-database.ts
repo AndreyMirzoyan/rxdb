@@ -404,22 +404,18 @@ export class RxDatabaseBase<
         DB_COUNT--;
         this.destroyed = true;
 
-        if (this.broadcastChannel) {
-            /**
-             * The broadcast-channel gets closed lazy
-             * to ensure that all pending change-events
-             * get emitted
-             */
-            setTimeout(() => (this.broadcastChannel as any).close(), 1000);
-        }
-
         this._subs.map(sub => sub.unsubscribe());
 
-        // destroy all collections
-        return Promise.all(Object.keys(this.collections)
-            .map(key => (this.collections as any)[key])
-            .map(col => col.destroy())
-        )
+        // first wait until db is idle
+        return this.requestIdlePromise()
+            // destroy all collections
+            .then(() => Promise.all(
+                Object.keys(this.collections)
+                    .map(key => (this.collections as any)[key])
+                    .map(col => col.destroy())
+            ))
+            // close broadcastChannel if exists
+            .then(() => this.broadcastChannel ? this.broadcastChannel.close() : Promise.resolve())
             // remove combination from USED_COMBINATIONS-map
             .then(() => _removeUsedCombination(this.name, this.adapter))
             .then(() => true);

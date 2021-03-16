@@ -12,7 +12,7 @@ import {
     Subject,
     Observable
 } from 'rxjs';
-
+import deepEqual from 'deep-equal';
 import {
     countAllUndeleted,
     getBatch
@@ -20,12 +20,15 @@ import {
 import {
     clone,
     toPromise,
-    flatClone
+    flatClone,
+    getHeightOfRevision,
+    createRevision
 } from '../../util';
 import {
     createRxSchema
 } from '../../rx-schema';
 import {
+    RxError,
     newRxError
 } from '../../rx-error';
 import { overwritable } from '../../overwritable';
@@ -291,11 +294,11 @@ export function migrateDocumentData(
     oldCollection: OldCollection,
     docData: any
 ): Promise<any | null> {
-    docData = clone(docData);
+    const mutateableDocData = clone(docData);
     let nextVersion = oldCollection.version + 1;
 
     // run the document throught migrationStrategies
-    let currentPromise = Promise.resolve(docData);
+    let currentPromise = Promise.resolve(mutateableDocData);
     while (nextVersion <= oldCollection.newestCollection.schema.version) {
         const version = nextVersion;
         currentPromise = currentPromise.then(docOrNull => _runStrategyIfNotNull(
@@ -312,15 +315,30 @@ export function migrateDocumentData(
         // check final schema
         try {
             oldCollection.newestCollection.schema.validate(doc);
-        } catch (e) {
+        } catch (err) {
+            const asRxError: RxError = err;
             throw newRxError('DM2', {
                 fromVersion: oldCollection.version,
                 toVersion: oldCollection.newestCollection.schema.version,
-                finalDoc: doc
+                originalDoc: docData,
+                finalDoc: doc,
+                /**
+                 * pass down data from parent error,
+                 * to make it better understandable what did not work
+                 */
+                errors: asRxError.parameters.errors,
+                schema: asRxError.parameters.schema
             });
         }
         return doc;
     });
+}
+
+
+export function isDocumentDataWithoutRevisionEqual<T>(doc1: T, doc2: T): boolean {
+    const doc1NoRev = Object.assign({}, doc1, { _rev: undefined });
+    const doc2NoRev = Object.assign({}, doc2, { _rev: undefined });
+    return deepEqual(doc1NoRev, doc2NoRev);
 }
 
 /**
@@ -329,18 +347,41 @@ export function migrateDocumentData(
  */
 export function _migrateDocument(
     oldCollection: OldCollection,
-    doc: any
+    docData: any
 ): Promise<{ type: string, doc: {} }> {
     const action = {
-        res: null,
+        res: null as any,
         type: '',
         migrated: null,
-        doc,
+        doc: docData,
         oldCollection,
         newestCollection: oldCollection.newestCollection
     };
-    return migrateDocumentData(oldCollection, doc)
+    return migrateDocumentData(oldCollection, docData)
         .then(migrated => {
+
+            /**
+             * Determiniticly handle the revision
+             * so migrating the same data on multiple instances
+             * will result in the same output.
+             */
+            if (isDocumentDataWithoutRevisionEqual(docData, migrated)) {
+                /**
+                 * Data not changed by migration strategies, keep the same revision.
+                 * This ensures that other replicated instances that did not migrate already
+                 * will still have the same document.
+                 */
+                migrated._rev = docData._rev;
+            } else if (migrated !== null) {
+                /**
+                 * data changed, increase revision height
+                 * so replicating instances use our new document data
+                 */
+                const newHeight = getHeightOfRevision(docData._rev) + 1;
+                const newRevision = newHeight + '-' + createRevision(migrated, true);
+                migrated._rev = newRevision;
+            }
+
             action.migrated = migrated;
             if (migrated) {
                 runPluginHooks(
@@ -349,22 +390,36 @@ export function _migrateDocument(
                 );
 
                 // save to newest collection
-                delete migrated._rev;
-                return oldCollection.newestCollection._pouchPut(migrated, true)
-                    .then(res => {
-                        action.res = res;
+                const saveData = oldCollection.newestCollection._handleToPouch(migrated);
+                return oldCollection.newestCollection.pouch
+                    .bulkDocs([saveData], {
+                        /**
+                         * We need new_edits: false
+                         * because we provide the _rev by our own
+                         */
+                        new_edits: false
+                    })
+                    .then(() => {
+                        action.res = saveData;
                         action.type = 'success';
                         return runAsyncPluginHooks(
                             'postMigrateDocument',
                             action
                         );
                     });
-            } else action.type = 'deleted';
+            } else {
+                /**
+                 * Migration strategy returned null
+                 * which means we should not migrate this document,
+                 * just drop it.
+                 */
+                action.type = 'deleted';
+            }
         })
         .then(() => {
             // remove from old collection
             return oldCollection.pouchdb.remove(
-                _handleToPouch(oldCollection, doc)
+                _handleToPouch(oldCollection, docData)
             ).catch(() => { });
         })
         .then(() => action) as any;

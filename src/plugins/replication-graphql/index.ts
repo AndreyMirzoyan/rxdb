@@ -14,8 +14,6 @@ import {
     filter
 } from 'rxjs/operators';
 import GraphQLClient from 'graphql-client';
-
-
 import {
     promiseWait,
     flatClone,
@@ -136,9 +134,17 @@ export class RxGraphQLReplicationState {
     }
 
     isStopped(): boolean {
-        if (!this.live && this._subjects.initialReplicationComplete['_value']) return true;
-        if (this._subjects.canceled['_value']) return true;
-        else return false;
+        if (this.collection.destroyed) {
+            return true;
+        }
+        if (!this.live && this._subjects.initialReplicationComplete['_value']) {
+            return true;
+        }
+        if (this._subjects.canceled['_value']) {
+            return true;
+        }
+
+        return false;
     }
 
     awaitInitialReplication(): Promise<true> {
@@ -206,7 +212,9 @@ export class RxGraphQLReplicationState {
      */
     async runPull(): Promise<boolean> {
         // console.log('RxGraphQLReplicationState.runPull(): start');
-        if (this.isStopped()) return Promise.resolve(false);
+        if (this.isStopped()) {
+            return Promise.resolve(false);
+        }
 
         const latestDocument = await getLastPullDocument(this.collection, this.endpointHash);
         const latestDocumentData = latestDocument ? latestDocument : null;
@@ -258,6 +266,9 @@ export class RxGraphQLReplicationState {
             this.collection,
             docIds
         );
+        if (this.isStopped()) {
+            return true;
+        }
         await this.handleDocumentsFromRemote(modified, docsWithRevisions as any);
         modified.map((doc: any) => this._subjects.recieved.next(doc));
 
@@ -379,8 +390,8 @@ export class RxGraphQLReplicationState {
         return true;
     }
 
-    async handleDocumentsFromRemote(docs: any[], docsWithRevisions: any[]) {
-        const toPouchDocs = [];
+    async handleDocumentsFromRemote(docs: any[], docsWithRevisions: any[]): Promise<boolean> {
+        const toPouchDocs: any[] = [];
         for (const doc of docs) {
             const deletedValue = doc[this.deletedFlag];
             const toPouch = this.collection._handleToPouch(doc);
@@ -418,11 +429,19 @@ export class RxGraphQLReplicationState {
                 deletedValue
             });
         }
+
+
         const startTime = now();
-        await this.collection.pouch.bulkDocs(
-            toPouchDocs.map(tpd => tpd.doc), {
-            new_edits: false
-        });
+        await this.collection.database.lockedRun(
+            async () => {
+                await this.collection.pouch.bulkDocs(
+                    toPouchDocs.map(tpd => tpd.doc),
+                    {
+                        new_edits: false
+                    }
+                );
+            }
+        );
         const endTime = now();
 
         /**
@@ -450,10 +469,14 @@ export class RxGraphQLReplicationState {
             );
             this.collection.$emit(cE);
         }
+
+        return true;
     }
 
     cancel(): Promise<any> {
-        if (this.isStopped()) return Promise.resolve(false);
+        if (this.isStopped()) {
+            return Promise.resolve(false);
+        }
         this._subs.forEach(sub => sub.unsubscribe());
         this._subjects.canceled.next(true);
         return Promise.resolve(true);
@@ -513,11 +536,19 @@ export function syncGraphQL(
         graphQLClientFabric
     );
 
-    if (!autoStart) return replicationState;
+    if (!autoStart) {
+        return replicationState;
+    }
 
     // run internal so .sync() does not have to be async
-    const waitTillRun: any = waitForLeadership ? this.database.waitForLeadership() : promiseWait(0);
+    const waitTillRun: any = (
+        waitForLeadership &&
+        this.database.multiInstance // do not await leadership if not multiInstance
+    ) ? this.database.waitForLeadership() : promiseWait(0);
     waitTillRun.then(() => {
+        if (collection.destroyed) {
+            return;
+        }
 
         // trigger run once
         replicationState.run();

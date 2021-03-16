@@ -1420,9 +1420,14 @@ function postMigrateDocument(action) {
     }).then(function (data) {
       return blobBufferUtil.toString(data);
     }).then(function (data) {
-      return action.newestCollection.pouch.putAttachment(primary, id, action.res.rev, blobBufferUtil.createBlobBuffer(data, stubData.content_type), stubData.content_type);
+      return action.newestCollection.pouch.putAttachment(primary, id, action.res._rev, blobBufferUtil.createBlobBuffer(data, stubData.content_type), stubData.content_type);
     }).then(function (res) {
-      return action.res = res;
+      /**
+       * Update revision so the next run
+       * does not cause a 403 conflict
+       */
+      action.res = (0, _util.flatClone)(action.res);
+      action.res._rev = res.rev;
     });
   });
   return currentPromise;
@@ -2213,6 +2218,8 @@ var ERROR_MESSAGES = {
   RC1: 'Replication: already added',
   RC2: 'RxCollection.sync() query must be from the same RxCollection',
   RC3: 'RxCollection.sync() Do not use a collection\'s pouchdb as remote, use the collection instead',
+  RC4: 'RxReplicationState.awaitInitialReplication() cannot await inital replication when live: true',
+  RC5: 'RxReplicationState.awaitInitialReplication() cannot await inital replication if multiInstance because the replication might run on another instance',
   // plugins/dev-mode/check-schema.js
   SC1: 'fieldnames do not match the regex',
   SC2: 'SchemaCheck: name \'item\' reserved for array-fields',
@@ -3881,6 +3888,8 @@ exports.RxDBLocalDocumentsPlugin = RxDBLocalDocumentsPlugin;
 },{"../doc-cache":5,"../rx-change-event":38,"../rx-collection":40,"../rx-database":42,"../rx-document":44,"../rx-error":45,"../util":55,"@babel/runtime/helpers/asyncToGenerator":59,"@babel/runtime/helpers/inheritsLoose":63,"@babel/runtime/helpers/interopRequireDefault":64,"@babel/runtime/regenerator":71,"object-path":499,"rxjs/operators":731}],27:[function(require,module,exports){
 "use strict";
 
+var _interopRequireDefault = require("@babel/runtime/helpers/interopRequireDefault");
+
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
@@ -3891,6 +3900,7 @@ exports.createDataMigrator = createDataMigrator;
 exports._runStrategyIfNotNull = _runStrategyIfNotNull;
 exports.getBatchOfOldCollection = getBatchOfOldCollection;
 exports.migrateDocumentData = migrateDocumentData;
+exports.isDocumentDataWithoutRevisionEqual = isDocumentDataWithoutRevisionEqual;
 exports._migrateDocument = _migrateDocument;
 exports.deleteOldCollection = deleteOldCollection;
 exports.migrateOldCollection = migrateOldCollection;
@@ -3898,6 +3908,8 @@ exports.migratePromise = migratePromise;
 exports.DataMigrator = void 0;
 
 var _rxjs = require("rxjs");
+
+var _deepEqual = _interopRequireDefault(require("deep-equal"));
 
 var _pouchDb = require("../../pouch-db");
 
@@ -4125,10 +4137,10 @@ function getBatchOfOldCollection(oldCollection, batchSize) {
 
 
 function migrateDocumentData(oldCollection, docData) {
-  docData = (0, _util.clone)(docData);
+  var mutateableDocData = (0, _util.clone)(docData);
   var nextVersion = oldCollection.version + 1; // run the document throught migrationStrategies
 
-  var currentPromise = Promise.resolve(docData);
+  var currentPromise = Promise.resolve(mutateableDocData);
 
   var _loop2 = function _loop2() {
     var version = nextVersion;
@@ -4147,16 +4159,35 @@ function migrateDocumentData(oldCollection, docData) {
 
     try {
       oldCollection.newestCollection.schema.validate(doc);
-    } catch (e) {
+    } catch (err) {
+      var asRxError = err;
       throw (0, _rxError.newRxError)('DM2', {
         fromVersion: oldCollection.version,
         toVersion: oldCollection.newestCollection.schema.version,
-        finalDoc: doc
+        originalDoc: docData,
+        finalDoc: doc,
+
+        /**
+         * pass down data from parent error,
+         * to make it better understandable what did not work
+         */
+        errors: asRxError.parameters.errors,
+        schema: asRxError.parameters.schema
       });
     }
 
     return doc;
   });
+}
+
+function isDocumentDataWithoutRevisionEqual(doc1, doc2) {
+  var doc1NoRev = Object.assign({}, doc1, {
+    _rev: undefined
+  });
+  var doc2NoRev = Object.assign({}, doc2, {
+    _rev: undefined
+  });
+  return (0, _deepEqual["default"])(doc1NoRev, doc2NoRev);
 }
 /**
  * transform docdata and save to new collection
@@ -4164,31 +4195,67 @@ function migrateDocumentData(oldCollection, docData) {
  */
 
 
-function _migrateDocument(oldCollection, doc) {
+function _migrateDocument(oldCollection, docData) {
   var action = {
     res: null,
     type: '',
     migrated: null,
-    doc: doc,
+    doc: docData,
     oldCollection: oldCollection,
     newestCollection: oldCollection.newestCollection
   };
-  return migrateDocumentData(oldCollection, doc).then(function (migrated) {
+  return migrateDocumentData(oldCollection, docData).then(function (migrated) {
+    /**
+     * Determiniticly handle the revision
+     * so migrating the same data on multiple instances
+     * will result in the same output.
+     */
+    if (isDocumentDataWithoutRevisionEqual(docData, migrated)) {
+      /**
+       * Data not changed by migration strategies, keep the same revision.
+       * This ensures that other replicated instances that did not migrate already
+       * will still have the same document.
+       */
+      migrated._rev = docData._rev;
+    } else if (migrated !== null) {
+      /**
+       * data changed, increase revision height
+       * so replicating instances use our new document data
+       */
+      var newHeight = (0, _util.getHeightOfRevision)(docData._rev) + 1;
+      var newRevision = newHeight + '-' + (0, _util.createRevision)(migrated, true);
+      migrated._rev = newRevision;
+    }
+
     action.migrated = migrated;
 
     if (migrated) {
       (0, _hooks.runPluginHooks)('preMigrateDocument', action); // save to newest collection
 
-      delete migrated._rev;
-      return oldCollection.newestCollection._pouchPut(migrated, true).then(function (res) {
-        action.res = res;
+      var saveData = oldCollection.newestCollection._handleToPouch(migrated);
+
+      return oldCollection.newestCollection.pouch.bulkDocs([saveData], {
+        /**
+         * We need new_edits: false
+         * because we provide the _rev by our own
+         */
+        new_edits: false
+      }).then(function () {
+        action.res = saveData;
         action.type = 'success';
         return (0, _hooks.runAsyncPluginHooks)('postMigrateDocument', action);
       });
-    } else action.type = 'deleted';
+    } else {
+      /**
+       * Migration strategy returned null
+       * which means we should not migrate this document,
+       * just drop it.
+       */
+      action.type = 'deleted';
+    }
   }).then(function () {
     // remove from old collection
-    return oldCollection.pouchdb.remove((0, _rxCollectionHelper._handleToPouch)(oldCollection, doc))["catch"](function () {});
+    return oldCollection.pouchdb.remove((0, _rxCollectionHelper._handleToPouch)(oldCollection, docData))["catch"](function () {});
   }).then(function () {
     return action;
   });
@@ -4273,7 +4340,7 @@ function migratePromise(oldCollection, batchSize) {
 }
 
 
-},{"../../crypter":4,"../../hooks":7,"../../overwritable":9,"../../pouch-db":36,"../../rx-collection-helper":39,"../../rx-error":45,"../../rx-schema":47,"../../util":55,"rxjs":532}],28:[function(require,module,exports){
+},{"../../crypter":4,"../../hooks":7,"../../overwritable":9,"../../pouch-db":36,"../../rx-collection-helper":39,"../../rx-error":45,"../../rx-schema":47,"../../util":55,"@babel/runtime/helpers/interopRequireDefault":64,"deep-equal":428,"rxjs":532}],28:[function(require,module,exports){
 "use strict";
 
 Object.defineProperty(exports, "__esModule", {
@@ -5081,7 +5148,7 @@ var _watchForChanges = require("./watch-for-changes");
 var INTERNAL_POUCHDBS = new WeakSet();
 
 var RxReplicationStateBase = /*#__PURE__*/function () {
-  function RxReplicationStateBase(collection) {
+  function RxReplicationStateBase(collection, syncOptions) {
     var _this = this;
 
     this._subs = [];
@@ -5095,6 +5162,7 @@ var RxReplicationStateBase = /*#__PURE__*/function () {
       error: new _rxjs.Subject()
     };
     this.collection = collection;
+    this.syncOptions = syncOptions;
     // create getters
     Object.keys(this._subjects).forEach(function (key) {
       Object.defineProperty(_this, key + '$', {
@@ -5106,6 +5174,27 @@ var RxReplicationStateBase = /*#__PURE__*/function () {
   }
 
   var _proto = RxReplicationStateBase.prototype;
+
+  _proto.awaitInitialReplication = function awaitInitialReplication() {
+    if (this.syncOptions.options && this.syncOptions.options.live) {
+      throw (0, _rxError.newRxError)('RC4', {
+        database: this.collection.database.name,
+        collection: this.collection.name
+      });
+    }
+
+    if (this.collection.database.multiInstance && this.syncOptions.waitForLeadership) {
+      throw (0, _rxError.newRxError)('RC5', {
+        database: this.collection.database.name,
+        collection: this.collection.name
+      });
+    }
+
+    var that = this;
+    return that.complete$.pipe((0, _operators.filter)(function (x) {
+      return !!x;
+    }), (0, _operators.first)()).toPromise();
+  };
 
   _proto.cancel = function cancel() {
     if (this._pouchEventEmitterObject) this._pouchEventEmitterObject.cancel();
@@ -5205,8 +5294,8 @@ function setPouchEventEmitter(rxRepState, evEmitter) {
   }));
 }
 
-function createRxReplicationState(collection) {
-  return new RxReplicationStateBase(collection);
+function createRxReplicationState(collection, syncOptions) {
+  return new RxReplicationStateBase(collection, syncOptions);
 }
 
 function sync(_ref) {
@@ -5249,9 +5338,16 @@ function sync(_ref) {
 
   var syncFun = (0, _pouchDb.pouchReplicationFunction)(this.pouch, direction);
   if (query) useOptions.selector = query.keyCompress().selector;
-  var repState = createRxReplicationState(this); // run internal so .sync() does not have to be async
+  var repState = createRxReplicationState(this, {
+    remote: remote,
+    waitForLeadership: waitForLeadership,
+    direction: direction,
+    options: options,
+    query: query
+  }); // run internal so .sync() does not have to be async
 
-  var waitTillRun = waitForLeadership ? this.database.waitForLeadership() : (0, _util.promiseWait)(0);
+  var waitTillRun = waitForLeadership && this.database.multiInstance // do not await leadership if not multiInstance
+  ? this.database.waitForLeadership() : (0, _util.promiseWait)(0);
   waitTillRun.then(function () {
     var pouchSync = syncFun(remote, useOptions);
 
@@ -5718,7 +5814,7 @@ exports.createQueryCache = createQueryCache;
 exports.uncacheRxQuery = uncacheRxQuery;
 exports.countRxQuerySubscribers = countRxQuerySubscribers;
 exports.triggerCacheReplacement = triggerCacheReplacement;
-exports.COLLECTIONS_WITH_DESTROY_HOOK = exports.CACHE_REPLACEMENT_STATE_BY_COLLECTION = exports.defaultCacheReplacementPolicy = exports.defaultCacheReplacementPolicyMonad = exports.DEFAULT_CACHE_REPLACEMENT_WAIT_TIME = exports.DEFAULT_UNEXECUTED_LIFETME = exports.DEFAULT_TRY_TO_KEEP_MAX = exports.QueryCache = void 0;
+exports.COLLECTIONS_WITH_RUNNING_CLEANUP = exports.defaultCacheReplacementPolicy = exports.defaultCacheReplacementPolicyMonad = exports.DEFAULT_UNEXECUTED_LIFETME = exports.DEFAULT_TRY_TO_KEEP_MAX = exports.QueryCache = void 0;
 
 var _util = require("./util");
 
@@ -5773,8 +5869,6 @@ function countRxQuerySubscribers(rxQuery) {
 var DEFAULT_TRY_TO_KEEP_MAX = 100;
 exports.DEFAULT_TRY_TO_KEEP_MAX = DEFAULT_TRY_TO_KEEP_MAX;
 var DEFAULT_UNEXECUTED_LIFETME = 30 * 1000;
-exports.DEFAULT_UNEXECUTED_LIFETME = DEFAULT_UNEXECUTED_LIFETME;
-var DEFAULT_CACHE_REPLACEMENT_WAIT_TIME = 20 * 1000;
 /**
  * The default cache replacement policy
  * See docs-src/query-cache.md to learn how it should work.
@@ -5782,7 +5876,7 @@ var DEFAULT_CACHE_REPLACEMENT_WAIT_TIME = 20 * 1000;
  * This is a monad which makes it easier to unit test
  */
 
-exports.DEFAULT_CACHE_REPLACEMENT_WAIT_TIME = DEFAULT_CACHE_REPLACEMENT_WAIT_TIME;
+exports.DEFAULT_UNEXECUTED_LIFETME = DEFAULT_UNEXECUTED_LIFETME;
 
 var defaultCacheReplacementPolicyMonad = function defaultCacheReplacementPolicyMonad(tryToKeepMax, unExecutedLifetime) {
   return function (_collection, queryCache) {
@@ -5827,12 +5921,9 @@ var defaultCacheReplacementPolicyMonad = function defaultCacheReplacementPolicyM
 };
 
 exports.defaultCacheReplacementPolicyMonad = defaultCacheReplacementPolicyMonad;
-var defaultCacheReplacementPolicy = defaultCacheReplacementPolicyMonad(DEFAULT_TRY_TO_KEEP_MAX, DEFAULT_UNEXECUTED_LIFETME); // @link https://stackoverflow.com/a/56239226/3443137
-
+var defaultCacheReplacementPolicy = defaultCacheReplacementPolicyMonad(DEFAULT_TRY_TO_KEEP_MAX, DEFAULT_UNEXECUTED_LIFETME);
 exports.defaultCacheReplacementPolicy = defaultCacheReplacementPolicy;
-var CACHE_REPLACEMENT_STATE_BY_COLLECTION = new WeakMap();
-exports.CACHE_REPLACEMENT_STATE_BY_COLLECTION = CACHE_REPLACEMENT_STATE_BY_COLLECTION;
-var COLLECTIONS_WITH_DESTROY_HOOK = new WeakSet();
+var COLLECTIONS_WITH_RUNNING_CLEANUP = new WeakSet();
 /**
  * Triggers the cache replacement policy after waitTime has passed.
  * We do not run this directly because at exactly the time a query is created,
@@ -5840,33 +5931,30 @@ var COLLECTIONS_WITH_DESTROY_HOOK = new WeakSet();
  * Also this should not be triggered multiple times when waitTime is still waiting.
  */
 
-exports.COLLECTIONS_WITH_DESTROY_HOOK = COLLECTIONS_WITH_DESTROY_HOOK;
+exports.COLLECTIONS_WITH_RUNNING_CLEANUP = COLLECTIONS_WITH_RUNNING_CLEANUP;
 
 function triggerCacheReplacement(rxCollection) {
-  var waitTime = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : DEFAULT_CACHE_REPLACEMENT_WAIT_TIME;
-
-  if (CACHE_REPLACEMENT_STATE_BY_COLLECTION.has(rxCollection)) {
+  if (COLLECTIONS_WITH_RUNNING_CLEANUP.has(rxCollection)) {
     // already started
     return;
-  } // ensure we clean up the runnung timeouts when the collection is destroyed
-
-
-  if (!COLLECTIONS_WITH_DESTROY_HOOK.has(rxCollection)) {
-    rxCollection.onDestroy.then(function () {
-      var timeout = CACHE_REPLACEMENT_STATE_BY_COLLECTION.get(rxCollection);
-
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-    });
-    COLLECTIONS_WITH_DESTROY_HOOK.add(rxCollection);
   }
 
-  var val = setTimeout(function () {
-    CACHE_REPLACEMENT_STATE_BY_COLLECTION["delete"](rxCollection);
-    rxCollection.cacheReplacementPolicy(rxCollection, rxCollection._queryCache);
-  }, waitTime);
-  CACHE_REPLACEMENT_STATE_BY_COLLECTION.set(rxCollection, val);
+  COLLECTIONS_WITH_RUNNING_CLEANUP.add(rxCollection);
+  /**
+   * Do not run directly to not reduce result latency of a new query
+   */
+
+  (0, _util.nextTick)() // wait at least one tick
+  .then(function () {
+    return (0, _util.requestIdlePromise)();
+  }) // and then wait for the CPU to be idle
+  .then(function () {
+    if (!rxCollection.destroyed) {
+      rxCollection.cacheReplacementPolicy(rxCollection, rxCollection._queryCache);
+    }
+
+    COLLECTIONS_WITH_RUNNING_CLEANUP["delete"](rxCollection);
+  });
 }
 
 
@@ -5888,7 +5976,14 @@ exports.RxChangeEvent = void 0;
  * they can be grabbed by the observables of database, collection and document
  */
 var RxChangeEvent = /*#__PURE__*/function () {
-  function RxChangeEvent(operation, documentId, documentData, databaseToken, collectionName, isLocal, startTime, endTime, previousData, rxDocument) {
+  function RxChangeEvent(operation, documentId, documentData, databaseToken, collectionName, isLocal,
+  /**
+   * timestam on when the operation was triggered
+   * and when it was finished
+   * This is optional because we do not have this time
+   * for events that come from pouchdbs changestream.
+   */
+  startTime, endTime, previousData, rxDocument) {
     this.operation = operation;
     this.documentId = documentId;
     this.documentData = documentData;
@@ -6381,11 +6476,12 @@ var RxCollectionBase = /*#__PURE__*/function () {
           return Promise.all(rxDocuments.map(function (doc) {
             return _this6._runHooks('post', 'insert', docsMap.get(doc.primary), doc);
           })).then(function () {
+            var errorResults = results.filter(function (r) {
+              return !r.ok;
+            });
             return {
               rxDocuments: rxDocuments,
-              errorResults: results.filter(function (r) {
-                return !r.ok;
-              })
+              errorResults: errorResults
             };
           });
         }).then(function (_ref) {
@@ -6405,14 +6501,114 @@ var RxCollectionBase = /*#__PURE__*/function () {
         });
       });
     });
-  }
+  };
+
+  _proto.bulkRemove = /*#__PURE__*/function () {
+    var _bulkRemove = (0, _asyncToGenerator2["default"])( /*#__PURE__*/_regenerator["default"].mark(function _callee2(ids) {
+      var _this7 = this;
+
+      var rxDocumentMap, docsData, docsMap, removeDocs, startTime, results, endTime, okResults, rxDocuments;
+      return _regenerator["default"].wrap(function _callee2$(_context2) {
+        while (1) {
+          switch (_context2.prev = _context2.next) {
+            case 0:
+              _context2.next = 2;
+              return this.findByIds(ids);
+
+            case 2:
+              rxDocumentMap = _context2.sent;
+              docsData = [];
+              docsMap = new Map();
+              Array.from(rxDocumentMap.values()).forEach(function (rxDocument) {
+                var data = rxDocument.toJSON(true);
+                docsData.push(data);
+                docsMap.set(rxDocument.primary, data);
+              });
+              _context2.next = 8;
+              return Promise.all(docsData.map(function (doc) {
+                var primary = doc[_this7.schema.primaryPath];
+                return _this7._runHooks('pre', 'remove', doc, rxDocumentMap.get(primary));
+              }));
+
+            case 8:
+              docsData.forEach(function (doc) {
+                return doc._deleted = true;
+              });
+              removeDocs = docsData.map(function (doc) {
+                return _this7._handleToPouch(doc);
+              });
+              _context2.next = 12;
+              return this.database.lockedRun( /*#__PURE__*/(0, _asyncToGenerator2["default"])( /*#__PURE__*/_regenerator["default"].mark(function _callee() {
+                var bulkResults;
+                return _regenerator["default"].wrap(function _callee$(_context) {
+                  while (1) {
+                    switch (_context.prev = _context.next) {
+                      case 0:
+                        startTime = (0, _util.now)();
+                        _context.next = 3;
+                        return _this7.pouch.bulkDocs(removeDocs);
+
+                      case 3:
+                        bulkResults = _context.sent;
+                        return _context.abrupt("return", bulkResults);
+
+                      case 5:
+                      case "end":
+                        return _context.stop();
+                    }
+                  }
+                }, _callee);
+              })));
+
+            case 12:
+              results = _context2.sent;
+              endTime = (0, _util.now)();
+              okResults = results.filter(function (r) {
+                return r.ok;
+              });
+              _context2.next = 17;
+              return Promise.all(okResults.map(function (r) {
+                return _this7._runHooks('post', 'remove', docsMap.get(r.id), rxDocumentMap.get(r.id));
+              }));
+
+            case 17:
+              okResults.forEach(function (r) {
+                var rxDocument = rxDocumentMap.get(r.id);
+                var emitEvent = (0, _rxChangeEvent.createDeleteEvent)(_this7, docsMap.get(r.id), rxDocument._data, startTime, endTime, rxDocument);
+
+                _this7.$emit(emitEvent);
+              });
+              rxDocuments = okResults.map(function (r) {
+                return rxDocumentMap.get(r.id);
+              });
+              return _context2.abrupt("return", {
+                success: rxDocuments,
+                error: okResults.filter(function (r) {
+                  return !r.ok;
+                })
+              });
+
+            case 20:
+            case "end":
+              return _context2.stop();
+          }
+        }
+      }, _callee2, this);
+    }));
+
+    function bulkRemove(_x) {
+      return _bulkRemove.apply(this, arguments);
+    }
+
+    return bulkRemove;
+  }()
   /**
    * same as insert but overwrites existing document with same primary
    */
   ;
 
   _proto.upsert = function upsert(json) {
-    var _this7 = this;
+    var _this8 = this;
 
     var useJson = (0, _util.flatClone)(json);
     var primary = useJson[this.schema.primaryPath];
@@ -6433,7 +6629,7 @@ var RxCollectionBase = /*#__PURE__*/function () {
           return existing;
         });
       } else {
-        return _this7.insert(json);
+        return _this8.insert(json);
       }
     });
   }
@@ -6443,7 +6639,7 @@ var RxCollectionBase = /*#__PURE__*/function () {
   ;
 
   _proto.atomicUpsert = function atomicUpsert(json) {
-    var _this8 = this;
+    var _this9 = this;
 
     var primary = json[this.schema.primaryPath];
 
@@ -6463,7 +6659,7 @@ var RxCollectionBase = /*#__PURE__*/function () {
     }
 
     queue = queue.then(function () {
-      return _atomicUpsertEnsureRxDocumentExists(_this8, primary, json);
+      return _atomicUpsertEnsureRxDocumentExists(_this9, primary, json);
     }).then(function (wasInserted) {
       if (!wasInserted.inserted) {
         return _atomicUpsertUpdate(wasInserted.doc, json).then(function () {
@@ -6534,19 +6730,19 @@ var RxCollectionBase = /*#__PURE__*/function () {
   _proto.findByIds =
   /*#__PURE__*/
   function () {
-    var _findByIds = (0, _asyncToGenerator2["default"])( /*#__PURE__*/_regenerator["default"].mark(function _callee(ids) {
-      var _this9 = this;
+    var _findByIds = (0, _asyncToGenerator2["default"])( /*#__PURE__*/_regenerator["default"].mark(function _callee3(ids) {
+      var _this10 = this;
 
       var ret, mustBeQueried, result;
-      return _regenerator["default"].wrap(function _callee$(_context) {
+      return _regenerator["default"].wrap(function _callee3$(_context3) {
         while (1) {
-          switch (_context.prev = _context.next) {
+          switch (_context3.prev = _context3.next) {
             case 0:
               ret = new Map();
               mustBeQueried = []; // first try to fill from docCache
 
               ids.forEach(function (id) {
-                var doc = _this9._docCache.get(id);
+                var doc = _this10._docCache.get(id);
 
                 if (doc) {
                   ret.set(id, doc);
@@ -6556,42 +6752,42 @@ var RxCollectionBase = /*#__PURE__*/function () {
               }); // find everything which was not in docCache
 
               if (!(mustBeQueried.length > 0)) {
-                _context.next = 8;
+                _context3.next = 8;
                 break;
               }
 
-              _context.next = 6;
+              _context3.next = 6;
               return this.pouch.allDocs({
                 include_docs: true,
                 keys: mustBeQueried
               });
 
             case 6:
-              result = _context.sent;
+              result = _context3.sent;
               result.rows.forEach(function (row) {
                 if (!row.doc) {
                   // not found
                   return;
                 }
 
-                var plainData = _this9._handleFromPouch(row.doc);
+                var plainData = _this10._handleFromPouch(row.doc);
 
-                var doc = (0, _rxDocumentPrototypeMerge.createRxDocument)(_this9, plainData);
+                var doc = (0, _rxDocumentPrototypeMerge.createRxDocument)(_this10, plainData);
                 ret.set(doc.primary, doc);
               });
 
             case 8:
-              return _context.abrupt("return", ret);
+              return _context3.abrupt("return", ret);
 
             case 9:
             case "end":
-              return _context.stop();
+              return _context3.stop();
           }
         }
-      }, _callee, this);
+      }, _callee3, this);
     }));
 
-    function findByIds(_x) {
+    function findByIds(_x2) {
       return _findByIds.apply(this, arguments);
     }
 
@@ -6604,7 +6800,7 @@ var RxCollectionBase = /*#__PURE__*/function () {
   ;
 
   _proto.findByIds$ = function findByIds$(ids) {
-    var _this10 = this;
+    var _this11 = this;
 
     var currentValue = null;
     var initialPromise = this.findByIds(ids).then(function (docsMap) {
@@ -6630,7 +6826,7 @@ var RxCollectionBase = /*#__PURE__*/function () {
       var op = ev.operation;
 
       if (op === 'INSERT' || op === 'UPDATE') {
-        currentValue.set(ev.documentId, _this10._docCache.get(ev.documentId));
+        currentValue.set(ev.documentId, _this11._docCache.get(ev.documentId));
       } else {
         currentValue["delete"](ev.documentId);
       }
@@ -6860,11 +7056,11 @@ var RxCollectionBase = /*#__PURE__*/function () {
   }, {
     key: "onDestroy",
     get: function get() {
-      var _this11 = this;
+      var _this12 = this;
 
       if (!this._onDestroy) {
         this._onDestroy = new Promise(function (res) {
-          return _this11._onDestroyCall = res;
+          return _this12._onDestroyCall = res;
         });
       }
 
@@ -6997,26 +7193,26 @@ function _prepareCreateIndexes(rxCollection, spawnedPouchPromise) {
  */
 
 
-function create(_ref2, wasCreatedBefore) {
-  var database = _ref2.database,
-      name = _ref2.name,
-      schema = _ref2.schema,
-      _ref2$pouchSettings = _ref2.pouchSettings,
-      pouchSettings = _ref2$pouchSettings === void 0 ? {} : _ref2$pouchSettings,
-      _ref2$migrationStrate = _ref2.migrationStrategies,
-      migrationStrategies = _ref2$migrationStrate === void 0 ? {} : _ref2$migrationStrate,
-      _ref2$autoMigrate = _ref2.autoMigrate,
-      autoMigrate = _ref2$autoMigrate === void 0 ? true : _ref2$autoMigrate,
-      _ref2$statics = _ref2.statics,
-      statics = _ref2$statics === void 0 ? {} : _ref2$statics,
-      _ref2$methods = _ref2.methods,
-      methods = _ref2$methods === void 0 ? {} : _ref2$methods,
-      _ref2$attachments = _ref2.attachments,
-      attachments = _ref2$attachments === void 0 ? {} : _ref2$attachments,
-      _ref2$options = _ref2.options,
-      options = _ref2$options === void 0 ? {} : _ref2$options,
-      _ref2$cacheReplacemen = _ref2.cacheReplacementPolicy,
-      cacheReplacementPolicy = _ref2$cacheReplacemen === void 0 ? _queryCache.defaultCacheReplacementPolicy : _ref2$cacheReplacemen;
+function create(_ref3, wasCreatedBefore) {
+  var database = _ref3.database,
+      name = _ref3.name,
+      schema = _ref3.schema,
+      _ref3$pouchSettings = _ref3.pouchSettings,
+      pouchSettings = _ref3$pouchSettings === void 0 ? {} : _ref3$pouchSettings,
+      _ref3$migrationStrate = _ref3.migrationStrategies,
+      migrationStrategies = _ref3$migrationStrate === void 0 ? {} : _ref3$migrationStrate,
+      _ref3$autoMigrate = _ref3.autoMigrate,
+      autoMigrate = _ref3$autoMigrate === void 0 ? true : _ref3$autoMigrate,
+      _ref3$statics = _ref3.statics,
+      statics = _ref3$statics === void 0 ? {} : _ref3$statics,
+      _ref3$methods = _ref3.methods,
+      methods = _ref3$methods === void 0 ? {} : _ref3$methods,
+      _ref3$attachments = _ref3.attachments,
+      attachments = _ref3$attachments === void 0 ? {} : _ref3$attachments,
+      _ref3$options = _ref3.options,
+      options = _ref3$options === void 0 ? {} : _ref3$options,
+      _ref3$cacheReplacemen = _ref3.cacheReplacementPolicy,
+      cacheReplacementPolicy = _ref3$cacheReplacemen === void 0 ? _queryCache.defaultCacheReplacementPolicy : _ref3$cacheReplacemen;
   (0, _pouchDb.validateCouchDBString)(name); // ensure it is a schema-object
 
   if (!(0, _rxSchema.isInstanceOf)(schema)) {
@@ -7033,9 +7229,9 @@ function create(_ref2, wasCreatedBefore) {
   var collection = new RxCollectionBase(database, name, schema, pouchSettings, migrationStrategies, methods, attachments, options, cacheReplacementPolicy, statics);
   return collection.prepare(wasCreatedBefore).then(function () {
     // ORM add statics
-    Object.entries(statics).forEach(function (_ref3) {
-      var funName = _ref3[0],
-          fun = _ref3[1];
+    Object.entries(statics).forEach(function (_ref4) {
+      var funName = _ref4[0],
+          fun = _ref4[1];
       Object.defineProperty(collection, funName, {
         get: function get() {
           return fun.bind(collection);
@@ -9057,7 +9253,7 @@ var RxQueryBase = /*#__PURE__*/function () {
       if (!this._$) {
         /**
          * We use _resultsDocs$ to emit new results
-         * This also ensure that there is a reemit on subscribe
+         * This also ensures that there is a reemit on subscribe
          */
         var results$ = this._resultsDocs$.pipe((0, _operators.mergeMap)(function (docs) {
           return _ensureEqual(_this3).then(function (hasChanged) {
@@ -9078,7 +9274,7 @@ var RxQueryBase = /*#__PURE__*/function () {
           // copy the array so it wont matter if the user modifies it
           var ret = Array.isArray(docs) ? docs.slice() : docs;
           return ret;
-        }))['asObservable']();
+        })).asObservable();
         /**
          * subscribe to the changeEvent-stream so it detects changes if it has subscribers
          */
@@ -9962,6 +10158,7 @@ exports.adapterObject = adapterObject;
 exports.flatClone = flatClone;
 exports.flattenObject = flattenObject;
 exports.getHeightOfRevision = getHeightOfRevision;
+exports.createRevision = createRevision;
 exports.overwriteGetterForCaching = overwriteGetterForCaching;
 exports.isFolderPath = isFolderPath;
 exports.LOCAL_PREFIX = exports.isElectronRenderer = exports.clone = exports.RXDB_HASH_SALT = void 0;
@@ -9973,6 +10170,10 @@ var _clone = _interopRequireDefault(require("clone"));
 var _sparkMd = _interopRequireDefault(require("spark-md5"));
 
 var _isElectron = _interopRequireDefault(require("is-electron"));
+
+var _pouchdbMd = require("pouchdb-md5");
+
+var _pouchdbUtils = require("pouchdb-utils");
 
 /**
  * this contains a mapping to basic dependencies
@@ -10322,6 +10523,23 @@ function getHeightOfRevision(revString) {
   var first = revString.split('-')[0];
   return parseInt(first, 10);
 }
+
+/**
+ * Creates a revision string that does NOT include the revision height
+ * Copied and adapted from pouchdb-utils/src/rev.js
+ * TODO not longer needed when this PR is merged: https://github.com/pouchdb/pouchdb/pull/8274
+ */
+function createRevision(docData, deterministic_revs) {
+  if (!deterministic_revs) {
+    return (0, _pouchdbUtils.rev)(docData, false);
+  }
+
+  var docWithoutRev = Object.assign({}, docData, {
+    _rev: undefined,
+    _rev_tree: undefined
+  });
+  return (0, _pouchdbMd.stringMd5)(JSON.stringify(docWithoutRev));
+}
 /**
  * prefix of local pouchdb documents
  */
@@ -10360,7 +10578,7 @@ function isFolderPath(name) {
 }
 
 
-},{"@babel/runtime/helpers/interopRequireDefault":64,"clone":112,"is-electron":466,"random-token":526,"spark-md5":733}],56:[function(require,module,exports){
+},{"@babel/runtime/helpers/interopRequireDefault":64,"clone":112,"is-electron":466,"pouchdb-md5":520,"pouchdb-utils":524,"random-token":526,"spark-md5":733}],56:[function(require,module,exports){
 "use strict";
 
 require("./noConflict");
@@ -10414,6 +10632,7 @@ function _assertThisInitialized(self) {
 }
 
 module.exports = _assertThisInitialized;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],59:[function(require,module,exports){
 function asyncGeneratorStep(gen, resolve, reject, _next, _throw, key, arg) {
   try {
@@ -10452,14 +10671,16 @@ function _asyncToGenerator(fn) {
 }
 
 module.exports = _asyncToGenerator;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],60:[function(require,module,exports){
-var setPrototypeOf = require("./setPrototypeOf");
+var setPrototypeOf = require("@babel/runtime/helpers/setPrototypeOf");
 
-var isNativeReflectConstruct = require("./isNativeReflectConstruct");
+var isNativeReflectConstruct = require("@babel/runtime/helpers/isNativeReflectConstruct");
 
 function _construct(Parent, args, Class) {
   if (isNativeReflectConstruct()) {
     module.exports = _construct = Reflect.construct;
+    module.exports["default"] = module.exports, module.exports.__esModule = true;
   } else {
     module.exports = _construct = function _construct(Parent, args, Class) {
       var a = [null];
@@ -10469,13 +10690,16 @@ function _construct(Parent, args, Class) {
       if (Class) setPrototypeOf(instance, Class.prototype);
       return instance;
     };
+
+    module.exports["default"] = module.exports, module.exports.__esModule = true;
   }
 
   return _construct.apply(null, arguments);
 }
 
 module.exports = _construct;
-},{"./isNativeReflectConstruct":67,"./setPrototypeOf":68}],61:[function(require,module,exports){
+module.exports["default"] = module.exports, module.exports.__esModule = true;
+},{"@babel/runtime/helpers/isNativeReflectConstruct":67,"@babel/runtime/helpers/setPrototypeOf":68}],61:[function(require,module,exports){
 function _defineProperties(target, props) {
   for (var i = 0; i < props.length; i++) {
     var descriptor = props[i];
@@ -10493,24 +10717,30 @@ function _createClass(Constructor, protoProps, staticProps) {
 }
 
 module.exports = _createClass;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],62:[function(require,module,exports){
 function _getPrototypeOf(o) {
   module.exports = _getPrototypeOf = Object.setPrototypeOf ? Object.getPrototypeOf : function _getPrototypeOf(o) {
     return o.__proto__ || Object.getPrototypeOf(o);
   };
+  module.exports["default"] = module.exports, module.exports.__esModule = true;
   return _getPrototypeOf(o);
 }
 
 module.exports = _getPrototypeOf;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],63:[function(require,module,exports){
+var setPrototypeOf = require("@babel/runtime/helpers/setPrototypeOf");
+
 function _inheritsLoose(subClass, superClass) {
   subClass.prototype = Object.create(superClass.prototype);
   subClass.prototype.constructor = subClass;
-  subClass.__proto__ = superClass;
+  setPrototypeOf(subClass, superClass);
 }
 
 module.exports = _inheritsLoose;
-},{}],64:[function(require,module,exports){
+module.exports["default"] = module.exports, module.exports.__esModule = true;
+},{"@babel/runtime/helpers/setPrototypeOf":68}],64:[function(require,module,exports){
 function _interopRequireDefault(obj) {
   return obj && obj.__esModule ? obj : {
     "default": obj
@@ -10518,8 +10748,9 @@ function _interopRequireDefault(obj) {
 }
 
 module.exports = _interopRequireDefault;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],65:[function(require,module,exports){
-var _typeof = require("@babel/runtime/helpers/typeof");
+var _typeof = require("@babel/runtime/helpers/typeof")["default"];
 
 function _getRequireWildcardCache() {
   if (typeof WeakMap !== "function") return null;
@@ -10574,12 +10805,14 @@ function _interopRequireWildcard(obj) {
 }
 
 module.exports = _interopRequireWildcard;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{"@babel/runtime/helpers/typeof":69}],66:[function(require,module,exports){
 function _isNativeFunction(fn) {
   return Function.toString.call(fn).indexOf("[native code]") !== -1;
 }
 
 module.exports = _isNativeFunction;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],67:[function(require,module,exports){
 function _isNativeReflectConstruct() {
   if (typeof Reflect === "undefined" || !Reflect.construct) return false;
@@ -10587,7 +10820,7 @@ function _isNativeReflectConstruct() {
   if (typeof Proxy === "function") return true;
 
   try {
-    Date.prototype.toString.call(Reflect.construct(Date, [], function () {}));
+    Boolean.prototype.valueOf.call(Reflect.construct(Boolean, [], function () {}));
     return true;
   } catch (e) {
     return false;
@@ -10595,6 +10828,7 @@ function _isNativeReflectConstruct() {
 }
 
 module.exports = _isNativeReflectConstruct;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],68:[function(require,module,exports){
 function _setPrototypeOf(o, p) {
   module.exports = _setPrototypeOf = Object.setPrototypeOf || function _setPrototypeOf(o, p) {
@@ -10602,10 +10836,12 @@ function _setPrototypeOf(o, p) {
     return o;
   };
 
+  module.exports["default"] = module.exports, module.exports.__esModule = true;
   return _setPrototypeOf(o, p);
 }
 
 module.exports = _setPrototypeOf;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],69:[function(require,module,exports){
 function _typeof(obj) {
   "@babel/helpers - typeof";
@@ -10614,24 +10850,29 @@ function _typeof(obj) {
     module.exports = _typeof = function _typeof(obj) {
       return typeof obj;
     };
+
+    module.exports["default"] = module.exports, module.exports.__esModule = true;
   } else {
     module.exports = _typeof = function _typeof(obj) {
       return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj;
     };
+
+    module.exports["default"] = module.exports, module.exports.__esModule = true;
   }
 
   return _typeof(obj);
 }
 
 module.exports = _typeof;
+module.exports["default"] = module.exports, module.exports.__esModule = true;
 },{}],70:[function(require,module,exports){
-var getPrototypeOf = require("./getPrototypeOf");
+var getPrototypeOf = require("@babel/runtime/helpers/getPrototypeOf");
 
-var setPrototypeOf = require("./setPrototypeOf");
+var setPrototypeOf = require("@babel/runtime/helpers/setPrototypeOf");
 
-var isNativeFunction = require("./isNativeFunction");
+var isNativeFunction = require("@babel/runtime/helpers/isNativeFunction");
 
-var construct = require("./construct");
+var construct = require("@babel/runtime/helpers/construct");
 
 function _wrapNativeSuper(Class) {
   var _cache = typeof Map === "function" ? new Map() : undefined;
@@ -10664,11 +10905,13 @@ function _wrapNativeSuper(Class) {
     return setPrototypeOf(Wrapper, Class);
   };
 
+  module.exports["default"] = module.exports, module.exports.__esModule = true;
   return _wrapNativeSuper(Class);
 }
 
 module.exports = _wrapNativeSuper;
-},{"./construct":60,"./getPrototypeOf":62,"./isNativeFunction":66,"./setPrototypeOf":68}],71:[function(require,module,exports){
+module.exports["default"] = module.exports, module.exports.__esModule = true;
+},{"@babel/runtime/helpers/construct":60,"@babel/runtime/helpers/getPrototypeOf":62,"@babel/runtime/helpers/isNativeFunction":66,"@babel/runtime/helpers/setPrototypeOf":68}],71:[function(require,module,exports){
 module.exports = require("regenerator-runtime");
 
 },{"regenerator-runtime":527}],72:[function(require,module,exports){
@@ -27852,14 +28095,6 @@ module.exports = gen
 },{"is-property":473}],450:[function(require,module,exports){
 'use strict';
 
-/* globals
-	AggregateError,
-	Atomics,
-	FinalizationRegistry,
-	SharedArrayBuffer,
-	WeakRef,
-*/
-
 var undefined;
 
 var $SyntaxError = SyntaxError;
@@ -27869,8 +28104,7 @@ var $TypeError = TypeError;
 // eslint-disable-next-line consistent-return
 var getEvalledConstructor = function (expressionSyntax) {
 	try {
-		// eslint-disable-next-line no-new-func
-		return Function('"use strict"; return (' + expressionSyntax + ').constructor;')();
+		return $Function('"use strict"; return (' + expressionSyntax + ').constructor;')();
 	} catch (e) {}
 };
 
@@ -27907,9 +28141,7 @@ var hasSymbols = require('has-symbols')();
 
 var getProto = Object.getPrototypeOf || function (x) { return x.__proto__; }; // eslint-disable-line no-proto
 
-var asyncGenFunction = getEvalledConstructor('async function* () {}');
-var asyncGenFunctionPrototype = asyncGenFunction ? asyncGenFunction.prototype : undefined;
-var asyncGenPrototype = asyncGenFunctionPrototype ? asyncGenFunctionPrototype.prototype : undefined;
+var needsEval = {};
 
 var TypedArray = typeof Uint8Array === 'undefined' ? undefined : getProto(Uint8Array);
 
@@ -27919,10 +28151,10 @@ var INTRINSICS = {
 	'%ArrayBuffer%': typeof ArrayBuffer === 'undefined' ? undefined : ArrayBuffer,
 	'%ArrayIteratorPrototype%': hasSymbols ? getProto([][Symbol.iterator]()) : undefined,
 	'%AsyncFromSyncIteratorPrototype%': undefined,
-	'%AsyncFunction%': getEvalledConstructor('async function () {}'),
-	'%AsyncGenerator%': asyncGenFunctionPrototype,
-	'%AsyncGeneratorFunction%': asyncGenFunction,
-	'%AsyncIteratorPrototype%': asyncGenPrototype ? getProto(asyncGenPrototype) : undefined,
+	'%AsyncFunction%': needsEval,
+	'%AsyncGenerator%': needsEval,
+	'%AsyncGeneratorFunction%': needsEval,
+	'%AsyncIteratorPrototype%': needsEval,
 	'%Atomics%': typeof Atomics === 'undefined' ? undefined : Atomics,
 	'%BigInt%': typeof BigInt === 'undefined' ? undefined : BigInt,
 	'%Boolean%': Boolean,
@@ -27939,7 +28171,7 @@ var INTRINSICS = {
 	'%Float64Array%': typeof Float64Array === 'undefined' ? undefined : Float64Array,
 	'%FinalizationRegistry%': typeof FinalizationRegistry === 'undefined' ? undefined : FinalizationRegistry,
 	'%Function%': $Function,
-	'%GeneratorFunction%': getEvalledConstructor('function* () {}'),
+	'%GeneratorFunction%': needsEval,
 	'%Int8Array%': typeof Int8Array === 'undefined' ? undefined : Int8Array,
 	'%Int16Array%': typeof Int16Array === 'undefined' ? undefined : Int16Array,
 	'%Int32Array%': typeof Int32Array === 'undefined' ? undefined : Int32Array,
@@ -27978,6 +28210,31 @@ var INTRINSICS = {
 	'%WeakMap%': typeof WeakMap === 'undefined' ? undefined : WeakMap,
 	'%WeakRef%': typeof WeakRef === 'undefined' ? undefined : WeakRef,
 	'%WeakSet%': typeof WeakSet === 'undefined' ? undefined : WeakSet
+};
+
+var doEval = function doEval(name) {
+	var value;
+	if (name === '%AsyncFunction%') {
+		value = getEvalledConstructor('async function () {}');
+	} else if (name === '%GeneratorFunction%') {
+		value = getEvalledConstructor('function* () {}');
+	} else if (name === '%AsyncGeneratorFunction%') {
+		value = getEvalledConstructor('async function* () {}');
+	} else if (name === '%AsyncGenerator%') {
+		var fn = doEval('%AsyncGeneratorFunction%');
+		if (fn) {
+			value = fn.prototype;
+		}
+	} else if (name === '%AsyncIteratorPrototype%') {
+		var gen = doEval('%AsyncGenerator%');
+		if (gen) {
+			value = getProto(gen.prototype);
+		}
+	}
+
+	INTRINSICS[name] = value;
+
+	return value;
 };
 
 var LEGACY_ALIASES = {
@@ -28070,6 +28327,9 @@ var getBaseIntrinsic = function getBaseIntrinsic(name, allowMissing) {
 
 	if (hasOwn(INTRINSICS, intrinsicName)) {
 		var value = INTRINSICS[intrinsicName];
+		if (value === needsEval) {
+			value = doEval(intrinsicName);
+		}
 		if (typeof value === 'undefined' && !allowMissing) {
 			throw new $TypeError('intrinsic ' + name + ' exists, but is not available. Please file an issue!');
 		}
@@ -29567,16 +29827,17 @@ module.exports = isProperty
 },{}],474:[function(require,module,exports){
 'use strict';
 
+var callBound = require('call-bind/callBound');
 var hasSymbols = require('has-symbols')();
 var hasToStringTag = hasSymbols && typeof Symbol.toStringTag === 'symbol';
-var hasOwnProperty;
-var regexExec;
+var has;
+var $exec;
 var isRegexMarker;
 var badStringifier;
 
 if (hasToStringTag) {
-	hasOwnProperty = Function.call.bind(Object.prototype.hasOwnProperty);
-	regexExec = Function.call.bind(RegExp.prototype.exec);
+	has = callBound('Object.prototype.hasOwnProperty');
+	$exec = callBound('RegExp.prototype.exec');
 	isRegexMarker = {};
 
 	var throwRegexMarker = function () {
@@ -29592,7 +29853,7 @@ if (hasToStringTag) {
 	}
 }
 
-var toStr = Object.prototype.toString;
+var $toString = callBound('Object.prototype.toString');
 var gOPD = Object.getOwnPropertyDescriptor;
 var regexClass = '[object RegExp]';
 
@@ -29604,13 +29865,13 @@ module.exports = hasToStringTag
 		}
 
 		var descriptor = gOPD(value, 'lastIndex');
-		var hasLastIndexDataProperty = descriptor && hasOwnProperty(descriptor, 'value');
+		var hasLastIndexDataProperty = descriptor && has(descriptor, 'value');
 		if (!hasLastIndexDataProperty) {
 			return false;
 		}
 
 		try {
-			regexExec(value, badStringifier);
+			$exec(value, badStringifier);
 		} catch (e) {
 			return e === isRegexMarker;
 		}
@@ -29621,10 +29882,10 @@ module.exports = hasToStringTag
 			return false;
 		}
 
-		return toStr.call(value) === regexClass;
+		return $toString(value) === regexClass;
 	};
 
-},{"has-symbols":451}],475:[function(require,module,exports){
+},{"call-bind/callBound":110,"has-symbols":451}],475:[function(require,module,exports){
 'use strict';
 
 var $Map = typeof Map === 'function' && Map.prototype ? Map : null;
